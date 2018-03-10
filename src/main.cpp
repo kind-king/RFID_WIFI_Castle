@@ -43,11 +43,13 @@ ESP8266WiFiMulti WiFiMulti;
 HTTPClient httpPi;
 
 /*------------------ BEGIN hash_t ------------------*/
-#define size_hash 7
+#define size_hash 20
 
+#pragma pack(push, 1) // Розмір кластера вирівнювання 1
 typedef struct {
 	uint8_t hash[size_hash];
 } hash_t;
+#pragma pack(pop) // Розмір кластера вирівнювання стандартний (4)
 
 bool operator < ( const hash_t & a, const hash_t & b ) {
 	for (int i = 0; i < size_hash; i++) {
@@ -96,8 +98,8 @@ bool operator == ( const hash_t & a, const hash_t & b ) {
 #define SS_PIN          D2           // Configurable, see typical pin layout above
 #define IRQ_PIN         D8           // Configurable, depends on hardware
 
-const char * const ssid[3]     = { "wave-rtf"           , "Casper"             , "BML"      };
-const char * const password[3] = { "2764637bodapidgorni", "2764637casper201206", "BMLadmin" };
+const char * const ssid[]     = { "wave-rtf"           , "Casper"             , "BML"     , "Cossaks"  };
+const char * const password[] = { "2764637bodapidgorni", "2764637casper201206", "BMLadmin", "asdf1234" };
 
 //                        "25 D4 98 65 88 94 30 B9 E9 62 3F 49 D3 A2 73 99 48 26 37 4E"
 //const char fingerprint[] = "25 D4 98 65 88 94 30 B9 E9 62 3F 49 D3 A2 73 99 48 26 37 4E";
@@ -107,10 +109,14 @@ MFRC522 mfrc522(SS_PIN, RST_PIN); // Create MFRC522 instance
 
 char _hostname[14]; // "RFID_%08X"
 
+typedef std::list<hash_t> hash_list;
+hash_list UID;
+
+
 void Beep(unsigned int time0, unsigned int time1, int N);
 void RelayTrigger();
 void dump_byte_array(byte * buffer, byte bufferSize);
-void BuildBuffer(char* uid, byte uidSize);
+void BuildBuffer(const hash_t & h);
 void GetInstructions(String jsonConfig);
 void updateESP(String FileBin);
 
@@ -133,7 +139,7 @@ void setup() {
   SPI.begin();           // Init SPI bus
   mfrc522.PCD_Init();    // Init MFRC522
 
-  for (int i = 0; i < 1; ++i)
+  for (int i = 0; i < 4; ++i)
     WiFiMulti.addAP(ssid[i], password[i]);
 
   httpPi.setReuse(true);
@@ -149,6 +155,50 @@ void setup() {
     // Hostname defaults to esp8266-[ChipID]
     sprintf(_hostname, "RFID_%08X", ESP.getChipId());
     DEBUG_println(_hostname);
+
+		DEBUG_print("SHA1:");
+		DEBUG_print(sha1("abc"));
+		//uint8_t hash[20];
+		hash_t h;
+		uint8_t data[] = {
+			0x04, 0x0B, 0x22, 0xB2, 0xB1, 0x56, 0x85, // Перша картка
+			(uint8_t)(ESP.getChipId() >> 24), (uint8_t)(ESP.getChipId() >> 16), // сіль
+			(uint8_t)(ESP.getChipId() >> 8) , (uint8_t)(ESP.getChipId() >> 0)
+		};
+    sha1( data , sizeof(data) , &h.hash[0] );
+		UID.push_back( h ); // Запис в ліст
+
+		for (byte i = 0; i < sizeof(data) - 4; ++i) {
+			data[i] = (uint8_t)( 0x040BA5AAFF4A81 >> (8*(sizeof(data)-5-i) ) ); // Друга картка
+		}
+    sha1( data , sizeof(data) , &h.hash[0] );
+		UID.push_back( h ); // Запис в ліст
+
+	#ifdef Project_DEBUG
+		std::list<hash_t>::iterator UID_Iter;
+		DEBUG_print("Before sorting: HASH_UID =\n");
+		for ( UID_Iter = UID.begin( ); UID_Iter != UID.end( ); UID_Iter++ ) {
+			for (int i = 0; i < sizeof(hash_t); i++)
+				printf("%02X ", (*UID_Iter).hash[i]);
+			DEBUG_println();
+		}
+		DEBUG_println();
+	#endif
+
+		UID.sort(); // Відсортувати для правильної роботи інших функцій обробки!
+		// UID.sort( operator > ); // Відсортувати за умовою
+		UID.unique(); // Видалити повторення
+
+	#ifdef Project_DEBUG
+		DEBUG_print("After sorting: HASH_UID =\n");
+		for ( UID_Iter = UID.begin( ); UID_Iter != UID.end( ); UID_Iter++ ) {
+			for (int i = 0; i < sizeof(hash_t); i++)
+				printf("%02X ", (*UID_Iter).hash[i]);
+			DEBUG_println();
+		}
+		DEBUG_println();
+	#endif
+
 
     DEBUG_println(F("Ready!"));
     DEBUG_println(F("======================================================"));
@@ -209,67 +259,65 @@ void RelayTrigger() {
 
 
 // Helper routine to dump a byte array as hex values to DEBUG_
-void dump_byte_array(byte * buffer, byte bufferSize) {
-  int j = 0;
-  char sBuffer[bufferSize * 2 + 1];
-  for (byte i = 0; i < bufferSize; i++) {
-    j += sprintf(sBuffer + j, "%02X", buffer[i]);
-  }
-  DEBUG_println(sBuffer);
-  //BuildBuffer(sBuffer, j);
+void dump_byte_array(uint8_t * buffer, uint8_t bufferSize) {
 
-  const byte aray_uid[] = { 0x04, 0x0B, 0xA5, 0xAA, 0xFF, 0x4A, 0x81,
-                            0x04, 0x0B, 0x22, 0xB2, 0xB1, 0x56, 0x85 };
+	std::list<hash_t>::iterator UID_Iter;
 
-  const int byte_UID = 7;
-  const int max_i = sizeof(aray_uid)/byte_UID;
-  DEBUG_println(sizeof(aray_uid)/byte_UID );
+	hash_t h;
+	uint8_t data[bufferSize + 4];
+	data[bufferSize+0] = (uint8_t)(ESP.getChipId() >> 24);
+	data[bufferSize+1] = (uint8_t)(ESP.getChipId() >> 16);
+	data[bufferSize+2] = (uint8_t)(ESP.getChipId() >> 8);
+	data[bufferSize+3] = (uint8_t)(ESP.getChipId() >> 0);
 
-  for (int i = 0; i < max_i; i++) {
-    for (int k = 0; k < byte_UID; k++) {
-      if (buffer[k] == aray_uid[i*byte_UID + k]) {
-        DEBUG_print("ok :");
-        DEBUG_println(buffer[k], HEX);
-        if (k == byte_UID - 1) {
-          RelayTrigger();
-          //open_door = true;
-          BuildBuffer(sBuffer, j);
-          return;
-        }
-      } else {
-        DEBUG_print("no :");
-        DEBUG_print(buffer[j], HEX);
-        DEBUG_print(" : ");
-        DEBUG_println(aray_uid[i*byte_UID+j], HEX);
-        break;
-      }
-    }
-  }
-  //open_door = false;
-  BuildBuffer(sBuffer, j);
-  //Beep(100, 200 , 5);
+	for (byte i = 0; i < bufferSize; ++i) {
+		data[i] = buffer[i];
+	}
+
+	sha1( data , sizeof(data) , &h.hash[0] );
+	UID_Iter = std::find( UID.begin(), UID.end(), h ); // Знайти об'єкт та повернути ітератор на нього
+	if ( *UID_Iter == h ) {
+		// Відкрити двері
+		RelayTrigger();
+		BuildBuffer( h );
+
+#ifdef Project_DEBUG
+		for (int i = 0; i < sizeof(hash_t); i++)
+			printf("%02X ", (*UID_Iter).hash[i]);
+#endif
+		//
+	} else {
+		// З'єднатися з сервером та перевірити чи це не є реєстрація нового користувача
+		// UID.push_back( h ); // Запис в ліст
+		BuildBuffer( h );
+	}
+
+
+
+
+	// const hash_t con = {0x04, 0x0B, 0x22, 0xB3, 0x00, 0x00, 0x00};
+	// UID_Iter = std::find( UID.begin(), UID.end(), con ); // Знайти об'єкт та повернути ітератор на нього
+	// UID.insert(UID_Iter, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00} ); // Вставити цей об'єкт на місце ітератора
+	// UID.remove({0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}); // Видалити цей об'єкт
+	// UID.remove_if(single_digit); // Видалити всі об'єкти за умовою
 }
 
 /************************************************
-   Build buffer
+   Build bufferv
  ************************************************/
-void BuildBuffer(char* uid, byte uidSize) {
-  unsigned int j = 0;
-  char* buffer = (char*) malloc(sizeof(urlLog) / sizeof(char) + 5 + sizeof(_hostname) / sizeof(char) + 5 + uidSize + 1); // uid.length()
+void BuildBuffer(const hash_t & h) {
+  char* buffer = (char*) malloc(sizeof(urlLog) + 5 + sizeof(_hostname) + 5 + sizeof(hash_t)*2 + 1); // uid.length()
   //char buffer[sizeof(urlLog) / sizeof(char) + 5 + sizeof(_hostname) / sizeof(char) + 5 + uidSize + 1]; // uid.length()
   //memset(buffer, '\0', sizeof(buffer) );
-  //sprintf(buffer, "%s?esp=%s&uid=%s", urlLog, uid);
-  j += sprintf(buffer, urlLog);
-  j += sprintf(buffer + j, "?esp=");
-  j += sprintf(buffer + j, _hostname);
-  j += sprintf(buffer + j, "&uid=");
-  for (int i = 0; i < uidSize; i++, j++) {
-    buffer[j] = uid[i];
-  }
+  byte j = sprintf(buffer, "%s?esp=%s&uid=", urlLog, _hostname);
+	for (int i = 0; i < sizeof(hash_t); ++i) {
+		j += sprintf(buffer + j, "%02X", h.hash[i]);
+	}
   buffer[j++] = '\0';
-  DEBUG_print("Lenght buffer = ");
+  DEBUG_print("Lenght payload = ");
   DEBUG_println(j);
-  DEBUG_println(sizeof(urlLog) / sizeof(char) + 5 + sizeof(_hostname) / sizeof(char) + 5 + uidSize);
+	DEBUG_print("Lenght buffer = ");
+  DEBUG_println(sizeof(urlLog) + 5 + sizeof(_hostname) + 5 + sizeof(hash_t)*2 + 1);
   //http://192.168.88.253/rfid/web/api/uid??esp=RFID_771906&uid=047710A2205284
   DEBUG_println(buffer);
 
