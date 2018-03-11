@@ -37,6 +37,8 @@
 
 #include <list>     // подключаем заголовок списка
 #include <iterator> // заголовок итераторов
+//#include <deque> 		// подключаем заголовочный файл деков
+#include <queue>    // подключаем заголовочный файл очереди
 /*------------------ END INCLUDE ------------------*/
 
 ESP8266WiFiMulti WiFiMulti;
@@ -65,11 +67,49 @@ bool operator > ( const hash_t & a, const hash_t & b ) {
 	return false;
 }
 
+bool operator <= ( const hash_t & a, const hash_t & b ) {
+	for (int i = 0; i < size_hash; i++) {
+		if (a.hash[i] != b.hash[i]) return a.hash[i] < b.hash[i];
+	}
+	return true;
+}
+
+bool operator >= ( const hash_t & a, const hash_t & b ) {
+	for (int i = 0; i < size_hash; i++) {
+		if (a.hash[i] != b.hash[i]) return a.hash[i] > b.hash[i];
+	}
+	return true;
+}
+
 bool operator == ( const hash_t & a, const hash_t & b ) {
 	for (int i = 0; i < size_hash; i++) {
 		if (a.hash[i] != b.hash[i]) return false;
 	}
 	return true;
+}
+
+hash_t operator ^ ( const hash_t & a, const hash_t & b ) {
+	hash_t res;
+	for (int i = 0; i < size_hash; i++) {
+		res.hash[i] = a.hash[i] ^ b.hash[i];
+	}
+	return res;
+}
+
+hash_t operator ^= ( const hash_t & a, const hash_t & b ) {
+	return a^b;
+}
+
+hash_t operator + ( const hash_t & a, const hash_t & b ) {
+	hash_t res;
+	uint16_t buff = 0;
+	for (int i = 0; i < size_hash; i++) {
+		buff >>= 8;
+		buff += a.hash[i] + b.hash[i];
+		res.hash[i] = (uint8_t)buff;
+		//bool overflow = __builtin_add_overflow( a.hash[i], b.hash[i], &res.hash[i] ); // '__builtin_add_overflow' was not declared in this scope
+	}
+	return res;
 }
 
 // A predicate
@@ -78,6 +118,14 @@ bool operator == ( const hash_t & a, const hash_t & b ) {
 // 	return (value < con_1 );
 // }
 /*------------------ END hash_t ------------------*/
+
+struct info {
+	uint64_t open : 1;
+	uint64_t time : 63;
+	hash_t uid;
+};
+
+
 
 /* wiring the MFRC522 to ESP8266 (ESP-12)
   RST     = GPIO5  D1
@@ -98,8 +146,9 @@ bool operator == ( const hash_t & a, const hash_t & b ) {
 #define SS_PIN          D2           // Configurable, see typical pin layout above
 #define IRQ_PIN         D8           // Configurable, depends on hardware
 
-const char * const ssid[]     = { "wave-rtf"           , "Casper"             , "BML"     , "Cossaks"  };
-const char * const password[] = { "2764637bodapidgorni", "2764637casper201206", "BMLadmin", "asdf1234" };
+const char * const ssid[]     = { "wave-rtf"           , "Casper"             , /*"BML"     ,*/ "Cossaks"  };
+const char * const password[] = { "2764637bodapidgorni", "2764637casper201206", /*"BMLadmin",*/ "asdf1234" };
+#define SSID 3
 
 //                        "25 D4 98 65 88 94 30 B9 E9 62 3F 49 D3 A2 73 99 48 26 37 4E"
 //const char fingerprint[] = "25 D4 98 65 88 94 30 B9 E9 62 3F 49 D3 A2 73 99 48 26 37 4E";
@@ -113,13 +162,16 @@ typedef std::list<hash_t> hash_list;
 hash_list UID;
 
 
-void Beep(unsigned int time0, unsigned int time1, int N);
+void Beep_s(unsigned int time0, unsigned int time1, int N);
+void Beep(unsigned int freq, unsigned int time);
 void RelayTrigger();
 void dump_byte_array(byte * buffer, byte bufferSize);
-void BuildBuffer(const hash_t & h);
-void GetInstructions(String jsonConfig);
+void BuildBuffer(hash_t & h, const bool & open);
+void BuildBuffer(info &inf);
+void GetInstructions(String jsonConfig, hash_t &h, const bool & open);
 void updateESP(String FileBin);
 
+std::queue<info> myQueue; // Створення черги
 
 void setup() {
   WiFi.persistent(false); // пароль буде записано на флеш, лише якщо поточні значення не відповідають тому, що вже зберігається у флеш-пам’яті.
@@ -139,7 +191,8 @@ void setup() {
   SPI.begin();           // Init SPI bus
   mfrc522.PCD_Init();    // Init MFRC522
 
-  for (int i = 0; i < 4; ++i)
+
+  for (int i = 0; i < SSID; ++i)
     WiFiMulti.addAP(ssid[i], password[i]);
 
   httpPi.setReuse(true);
@@ -156,9 +209,6 @@ void setup() {
     sprintf(_hostname, "RFID_%08X", ESP.getChipId());
     DEBUG_println(_hostname);
 
-		DEBUG_print("SHA1:");
-		DEBUG_print(sha1("abc"));
-		//uint8_t hash[20];
 		hash_t h;
 		uint8_t data[] = {
 			0x04, 0x0B, 0x22, 0xB2, 0xB1, 0x56, 0x85, // Перша картка
@@ -174,32 +224,32 @@ void setup() {
     sha1( data , sizeof(data) , &h.hash[0] );
 		UID.push_back( h ); // Запис в ліст
 
-	#ifdef Project_DEBUG
+		UID.push_back( {0x13, 0x18, 0x33, 0x2D, 0xAE, 0xE6, 0xCE, 0xBE, 0xA9, 0x38, 0x74, 0xDF, 0x1B, 0xFE, 0x08, 0x83, 0xD5, 0x42, 0xA9, 0xEF} );
+
+#ifdef Project_DEBUG
 		std::list<hash_t>::iterator UID_Iter;
 		DEBUG_print("Before sorting: HASH_UID =\n");
 		for ( UID_Iter = UID.begin( ); UID_Iter != UID.end( ); UID_Iter++ ) {
 			for (int i = 0; i < sizeof(hash_t); i++)
-				printf("%02X ", (*UID_Iter).hash[i]);
-			DEBUG_println();
+				DEBUG_printf("%02X ", (*UID_Iter).hash[i]);
+			DEBUG_printf("\n");
 		}
-		DEBUG_println();
-	#endif
+		DEBUG_printf("\n");
+#endif
 
 		UID.sort(); // Відсортувати для правильної роботи інших функцій обробки!
 		// UID.sort( operator > ); // Відсортувати за умовою
 		UID.unique(); // Видалити повторення
 
-	#ifdef Project_DEBUG
+#ifdef Project_DEBUG
 		DEBUG_print("After sorting: HASH_UID =\n");
 		for ( UID_Iter = UID.begin( ); UID_Iter != UID.end( ); UID_Iter++ ) {
 			for (int i = 0; i < sizeof(hash_t); i++)
-				printf("%02X ", (*UID_Iter).hash[i]);
-			DEBUG_println();
+				DEBUG_printf("%02X ", (*UID_Iter).hash[i]);
+			DEBUG_printf("\n");
 		}
-		DEBUG_println();
-	#endif
-
-
+		DEBUG_printf("\n");
+#endif
     DEBUG_println(F("Ready!"));
     DEBUG_println(F("======================================================"));
     DEBUG_println(F("Scan for Card and print UID:"));
@@ -208,7 +258,12 @@ void setup() {
 void loop() {
   if(WiFiMulti.run() != WL_CONNECTED) {
     DEBUG_println("WiFi reconnected!");
-    //delay(1000);
+    delay(100);
+  }
+	if (!myQueue.empty()) { // если дек не пуст
+    // вывод на экран элементов дека
+		// myQueue.size();
+		BuildBuffer(myQueue.front());
   }
   // Look for new cards
   if ( ! mfrc522.PICC_IsNewCardPresent()) {
@@ -223,15 +278,13 @@ void loop() {
   //const byte uid_size = mfrc522.uid.size;
   mfrc522.PICC_HaltA();
   mfrc522.PCD_StopCrypto1();
-  Beep(100, 0 , 1);
+  Beep_s(100, 0 , 1);
 
   // Show some details of the PICC (that is: the tag/card)
   DEBUG_print(F("Card UID:"));
   dump_byte_array(mfrc522.uid.uidByte, mfrc522.uid.size);
   //dump_byte_array(uid_selCard, uid_size);
   DEBUG_println();
-  //mfrc522.PICC_HaltA();
-  //mfrc522.PCD_StopCrypto1();
 }
 
 /**
@@ -241,7 +294,7 @@ void loop() {
  *
  * Опис:
 */
-void Beep(unsigned int time0, unsigned int time1, int N) {
+void Beep_s(unsigned int time0, unsigned int time1, int N) {
   for (int i = 0; i < N; i++) {
     digitalWrite(BUSER, LOW);
     delay(time0);
@@ -250,10 +303,32 @@ void Beep(unsigned int time0, unsigned int time1, int N) {
   }
 }
 
+/**
+ * @param freq Частота звучання (ШІМ)
+ * @param time Час звучання
+ * @param ampl Гучність звучання
+ *
+ * Ноти:
+ *E = 329		C5= 523.25
+ *B = 493		D5=587.33
+ *Fs = 698	E5=659.25
+ *Es = 659	F5=698.46
+ *Gs = 783	G5=783.99
+ *G = 392		A5=880.00
+ *A = 440
+ *D = 587
+ *F = 349
+*/
+void Beep(unsigned int freq, unsigned int time) {
+	analogWriteFreq(freq);
+	analogWrite(BUSER, PWMRANGE/2);
+	delay(time);
+}
+
 void RelayTrigger() {
   //if (open_door == false)
   digitalWrite(RELAY, HIGH);
-  Beep(50, 100 , 2); delay(500);
+  Beep_s(50, 100 , 2); delay(500);
   digitalWrite(RELAY, LOW);
 }
 
@@ -279,45 +354,109 @@ void dump_byte_array(uint8_t * buffer, uint8_t bufferSize) {
 	if ( *UID_Iter == h ) {
 		// Відкрити двері
 		RelayTrigger();
-		BuildBuffer( h );
-
-#ifdef Project_DEBUG
-		for (int i = 0; i < sizeof(hash_t); i++)
-			printf("%02X ", (*UID_Iter).hash[i]);
-#endif
-		//
+		BuildBuffer( h, true );
 	} else {
 		// З'єднатися з сервером та перевірити чи це не є реєстрація нового користувача
 		// UID.push_back( h ); // Запис в ліст
-		BuildBuffer( h );
+		BuildBuffer( h, false );
 	}
 
-
-
-
-	// const hash_t con = {0x04, 0x0B, 0x22, 0xB3, 0x00, 0x00, 0x00};
+#ifdef Project_DEBUG
+  DEBUG_printf("UID_Iter = ");
+	for (int i = 0; i < sizeof(hash_t); i++)
+		DEBUG_printf("%02X ", (*UID_Iter).hash[i]);
+  DEBUG_printf("\nh = ");
+	for (int i = 0; i < sizeof(hash_t); i++)
+		DEBUG_printf("%02X ", h.hash[i]);
+	DEBUG_printf("\n");
+#endif
+  // const hash_t con = {0x04, 0x0B, 0x22, 0xB3, 0x00, 0x00, 0x00};
 	// UID_Iter = std::find( UID.begin(), UID.end(), con ); // Знайти об'єкт та повернути ітератор на нього
 	// UID.insert(UID_Iter, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00} ); // Вставити цей об'єкт на місце ітератора
 	// UID.remove({0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}); // Видалити цей об'єкт
 	// UID.remove_if(single_digit); // Видалити всі об'єкти за умовою
+#ifdef Project_DEBUG
+	DEBUG_print("After sorting: HASH_UID =\n");
+	for ( UID_Iter = UID.begin( ); UID_Iter != UID.end( ); UID_Iter++ ) {
+		for (int i = 0; i < sizeof(hash_t); i++)
+			DEBUG_printf("%02X ", (*UID_Iter).hash[i]);
+		DEBUG_printf("\n");
+	}
+	DEBUG_printf("\n");
+#endif
 }
 
 /************************************************
    Build bufferv
  ************************************************/
-void BuildBuffer(const hash_t & h) {
-  char* buffer = (char*) malloc(sizeof(urlLog) + 5 + sizeof(_hostname) + 5 + sizeof(hash_t)*2 + 1); // uid.length()
-  //char buffer[sizeof(urlLog) / sizeof(char) + 5 + sizeof(_hostname) / sizeof(char) + 5 + uidSize + 1]; // uid.length()
-  //memset(buffer, '\0', sizeof(buffer) );
-  byte j = sprintf(buffer, "%s?esp=%s&uid=", urlLog, _hostname);
+void BuildBuffer(hash_t & h, const bool & open) {
+  char* buffer = (char*) malloc(sizeof(urlLog) + 5 + sizeof(_hostname) + 5 + sizeof(open) + 5 + sizeof(hash_t)*2 + 1); // uid.length()
+  byte j = sprintf(buffer, "%s?esp=%s&act=%d&uid=", urlLog, _hostname, open);
 	for (int i = 0; i < sizeof(hash_t); ++i) {
 		j += sprintf(buffer + j, "%02X", h.hash[i]);
 	}
-  buffer[j++] = '\0';
+	buffer[j++] = '\0';
   DEBUG_print("Lenght payload = ");
-  DEBUG_println(j);
+  DEBUG_var(j);
 	DEBUG_print("Lenght buffer = ");
-  DEBUG_println(sizeof(urlLog) + 5 + sizeof(_hostname) + 5 + sizeof(hash_t)*2 + 1);
+  DEBUG_println(sizeof(urlLog) + 5 + sizeof(_hostname) + 5 + sizeof(open) + 5 + sizeof(hash_t)*2 + 1);
+  //http://192.168.88.253/rfid/web/api/uid??esp=RFID_771906&uid=047710A2205284
+	//http://iot.kpi.ua/web/api/uid?esp=RFID_0017E5C6&act=1&uid=1318332DAEE6CEBEA93874DF1BFE0883D542A9EF
+  DEBUG_println(buffer);
+
+  if ((WiFiMulti.run() == WL_CONNECTED)) {
+
+    DEBUG_print("[HTTP] begin...\n");
+    // configure traged server and url
+    httpPi.begin(buffer);//, fingerprint); //HTTP"http://work.rtf.kpi.ua/web/"
+
+    DEBUG_print("[HTTP] GET...\n");
+    // start connection and send HTTP header
+    int httpCode = httpPi.GET();
+
+    // httpCode will be negative on error
+    if (httpCode > 0) {
+      // HTTP header has been send and Server response header has been handled
+      DEBUG_printf("[HTTP] GET... code: %d\n", httpCode);
+
+      // file found at server
+      if (httpCode == HTTP_CODE_OK) {
+        GetInstructions( httpPi.getString(), h , open);
+      } else {
+        DEBUG_println("Bad server!"); // Сервер відповів на запит негативно
+        Beep_s(25, 25 , 15);
+        DEBUG_println( httpPi.errorToString(httpCode).c_str() );
+      }
+    } else { // Сервер нічого не відповів
+      DEBUG_printf("[HTTP] GET... failed, error: %s\n", httpPi.errorToString(httpCode).c_str());
+      Beep_s(25, 25 , 15);
+			WiFi.disconnect(); // Перепідєднаємося!
+    }
+    httpPi.end();
+    DEBUG_print("dBm ");
+    DEBUG_println(WiFi.RSSI());
+  } else {
+    Beep_s(25, 25 , 15);
+    Beep_s(1000, 200 , 2);
+    // запис даних в ліст
+		myQueue.push( { .open = open, .time = millis(), .uid = h } ); // додати елемент в кінець
+  }
+}
+
+
+
+
+void BuildBuffer(info &inf) {																					   // "sizeof(inf.time)"     "sizeof(inf.open)" invalid application of 'sizeof' to a bit-field
+  char* buffer = (char*) malloc(sizeof(urlLog) + 5 + sizeof(_hostname) + 6 + sizeof(uint64_t) + 5 +        1         + 5 + sizeof(hash_t)*2 + 1); // uid.length()
+  byte j = sprintf(buffer, "%s?esp=%s&time=%d&act=%d&uid=", urlLog, _hostname, inf.time ,inf.open);
+	for (int i = 0; i < sizeof(hash_t); ++i) {
+		j += sprintf(buffer + j, "%02X", inf.uid.hash[i]);
+	}
+	buffer[j++] = '\0';
+  DEBUG_print("Lenght payload = ");
+  DEBUG_var(j);
+	DEBUG_print("Lenght buffer = ");											 												// "sizeof(inf.open)"
+  DEBUG_println(sizeof(urlLog) + 5 + sizeof(_hostname) + 6 + sizeof(uint64_t) + 5 +        1         + 5 + sizeof(hash_t)*2 + 1);
   //http://192.168.88.253/rfid/web/api/uid??esp=RFID_771906&uid=047710A2205284
   DEBUG_println(buffer);
 
@@ -338,29 +477,30 @@ void BuildBuffer(const hash_t & h) {
 
       // file found at server
       if (httpCode == HTTP_CODE_OK) {
-        GetInstructions( httpPi.getString() );
+        //GetInstructions( httpPi.getString(), h , open); // Не треба нічого робити
+				myQueue.pop(); // Видалити цей запис з черги
       } else {
         DEBUG_println("Bad server!"); // Сервер відповів на запит негативно
-        Beep(25, 25 , 15);
+        Beep_s(25, 25 , 15);
         DEBUG_println( httpPi.errorToString(httpCode).c_str() );
       }
     } else { // Сервер нічого не відповів
       DEBUG_printf("[HTTP] GET... failed, error: %s\n", httpPi.errorToString(httpCode).c_str());
-      Beep(25, 100 , 5);
+      Beep_s(25, 25 , 15);
+			WiFi.disconnect(); // Перепідєднаємося!
     }
     httpPi.end();
     DEBUG_print("dBm ");
     DEBUG_println(WiFi.RSSI());
-  } else {
-    Beep(25, 100 , 5);
-    Beep(1000, 0 , 1);
-    // wifi_conecting();
-    // запис даних в ліст
-
   }
 }
 
-void GetInstructions(String jsonConfig) {
+
+
+
+
+
+void GetInstructions(String jsonConfig, hash_t &h, const bool & open) {
   //DEBUG_println(jsonConfig);
   DynamicJsonBuffer jsonBuffer;
   JsonObject& root = jsonBuffer.parseObject(jsonConfig);
@@ -368,10 +508,10 @@ void GetInstructions(String jsonConfig) {
     DEBUG_println("parseObject() failed");
     return;
   }
-  #ifdef Project_DEBUG
+#ifdef Project_DEBUG
     root.prettyPrintTo(DEBUG_Serial);
     DEBUG_println();
-  #endif
+#endif
   /*
     {
     "esp": "RFID_12625188",
@@ -380,33 +520,86 @@ void GetInstructions(String jsonConfig) {
     "location_id": 3,
     "file_bin": "",
     "status": 200
+		"secret_key": 0xA94A8FE5CCB19BA61C4C0873D391E987982FBBD3
     }
   */
+	ESP.wdtFeed(); // нагодувати WDT
+
+	hash_t secret_xor = {0x01, 0x4A, 0x8F, 0xE5, 0xCC, 0xB1, 0x9B, 0xA6, 0x1C, 0x4C, 0x08, 0x73, 0xD3, 0x91, 0xE9, 0x87, 0x98, 0x2F, 0xBB, 0xD3};
+	secret_xor ^= h;
 
   switch(root["status"].as<int>()) {
     case 200: // Реєстрація
-      Beep(500, 100 , 1);
+			if(open) return; // Користувач вже є зареєстрований
+			//sha1( secret_xor.hash , sizeof(secret_xor) , &h.hash[0] );
+			if ( root["secret_key"].as<String>() == sha1(secret_xor.hash , sizeof(secret_xor)) ) {
+			//if ( root["secret_key"].as<hash_t>() == h ) {
+				UID.push_back( h ); // Запис в ліст
+				UID.sort(); // Відсортувати для правильної роботи інших функцій обробки!
+#ifdef Project_DEBUG
+				std::list<hash_t>::iterator UID_Iter;
+				DEBUG_print("After sorting: HASH_UID =\n");
+				for ( UID_Iter = UID.begin( ); UID_Iter != UID.end( ); UID_Iter++ ) {
+					for (int i = 0; i < sizeof(hash_t); i++)
+						DEBUG_printf("%02X ", (*UID_Iter).hash[i]);
+					DEBUG_printf("\n");
+				}
+				DEBUG_printf("\n");
+#endif
+				RelayTrigger(); // Відчинити двері
+				Beep_s(500, 100 , 1);
+			} else {
+				DEBUG_println("Error secret_key!!!");
+				Beep(523,500);  // 523 hertz (C5) for 500 milliseconds
+				Beep(587,500);
+				Beep(659,500);
+				Beep(698,500);
+				Beep(784,500);
+			}
       break;
     case 201: // вхід користувача
-      Beep(50, 100 , 2);
-      RelayTrigger();
-
-      //delay(5000);
+			if(open) return; // Користувач вже увійшов
+			// Відкрити двері але не реєструвати користувача
+			//sha1( secret_xor.hash , sizeof(secret_xor) , &h.hash[0] );
+			if ( root["secret_key"].as<String>() == sha1(secret_xor.hash , sizeof(secret_xor)) ) {
+			//if ( root["secret_key"].as<hash_t>() == h ) {
+				RelayTrigger(); // Відчинити двері
+				Beep_s(300, 100 , 3);
+			} else {
+				DEBUG_println("Error secret_key!!!");
+				Beep(523,500);  // 523 hertz (C5) for 500 milliseconds
+				Beep(587,500);
+				Beep(659,500);
+				Beep(698,500);
+				Beep(784,500);
+			}
       break;
 //    case 202: // вихід користувача
-//      Beep(50, 50 , 4);
+//      Beep_s(50, 50 , 4);
 //      //delay(5000);
 //      break;
     case 203: // оновленя прошивки
       updateESP( root["file_bin"].as<String>() );
       break;
     case 401: // не зареєстрований девайс
-      Beep(500, 250 , 3);
-      break;
     case 402: // не зареєстрований користувач
-      Beep(100, 200 , 5);
-      break;
     case 403: // 402 та 401
+			Beep_s(500, 500 , 6);
+			if(open) { // Користувач вже увійшов
+				//sha1( secret_xor.hash , sizeof(secret_xor) , &h.hash[0] );
+				if ( root["secret_key"].as<String>() == sha1(secret_xor.hash , sizeof(secret_xor)) ) {
+				//if ( root["secret_key"].as<hash_t>() == h ) {
+					// Не санкціонований вхід!
+					UID.remove(h); // Видалити цей об'єкт
+				} else { // Не довіряти серверу, та нічого не робити!
+					DEBUG_println("Error secret_key!!!");
+					Beep(523,500);  // 523 hertz (C5) for 500 milliseconds
+					Beep(587,500);
+					Beep(659,500);
+					Beep(698,500);
+					Beep(784,500);
+				}
+			}
       break;
   }
 }
