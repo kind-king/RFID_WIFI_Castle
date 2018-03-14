@@ -171,6 +171,7 @@ void BuildBuffer(info &inf);
 void GetInstructions(String jsonConfig, hash_t &h, const bool & open);
 void updateESP(String FileBin);
 
+unsigned long start = millis();
 std::queue<info> myQueue; // Створення черги
 
 void setup() {
@@ -191,7 +192,7 @@ void setup() {
   SPI.begin();           // Init SPI bus
   mfrc522.PCD_Init();    // Init MFRC522
 
-
+	WiFi.mode(WIFI_STA);
   for (int i = 0; i < SSID; ++i)
     WiFiMulti.addAP(ssid[i], password[i]);
 
@@ -212,8 +213,8 @@ void setup() {
 		hash_t h;
 		uint8_t data[] = {
 			0x04, 0x0B, 0x22, 0xB2, 0xB1, 0x56, 0x85, // Перша картка
-			(uint8_t)(ESP.getChipId() >> 24), (uint8_t)(ESP.getChipId() >> 16), // сіль
-			(uint8_t)(ESP.getChipId() >> 8) , (uint8_t)(ESP.getChipId() >> 0)
+			// (uint8_t)(ESP.getChipId() >> 24), (uint8_t)(ESP.getChipId() >> 16), // сіль
+			// (uint8_t)(ESP.getChipId() >> 8) , (uint8_t)(ESP.getChipId() >> 0)
 		};
     sha1( data , sizeof(data) , &h.hash[0] );
 		UID.push_back( h ); // Запис в ліст
@@ -224,7 +225,7 @@ void setup() {
     sha1( data , sizeof(data) , &h.hash[0] );
 		UID.push_back( h ); // Запис в ліст
 
-		UID.push_back( {0x13, 0x18, 0x33, 0x2D, 0xAE, 0xE6, 0xCE, 0xBE, 0xA9, 0x38, 0x74, 0xDF, 0x1B, 0xFE, 0x08, 0x83, 0xD5, 0x42, 0xA9, 0xEF} );
+		// UID.push_back( {0x13, 0x18, 0x33, 0x2D, 0xAE, 0xE6, 0xCE, 0xBE, 0xA9, 0x38, 0x74, 0xDF, 0x1B, 0xFE, 0x08, 0x83, 0xD5, 0x42, 0xA9, 0xEF} );
 
 #ifdef Project_DEBUG
 		std::list<hash_t>::iterator UID_Iter;
@@ -256,6 +257,7 @@ void setup() {
 }
 
 void loop() {
+	//start;
   if(WiFiMulti.run() != WL_CONNECTED) {
     DEBUG_println("WiFi reconnected!");
     delay(100);
@@ -339,11 +341,11 @@ void dump_byte_array(uint8_t * buffer, uint8_t bufferSize) {
 	std::list<hash_t>::iterator UID_Iter;
 
 	hash_t h;
-	uint8_t data[bufferSize + 4];
-	data[bufferSize+0] = (uint8_t)(ESP.getChipId() >> 24);
-	data[bufferSize+1] = (uint8_t)(ESP.getChipId() >> 16);
-	data[bufferSize+2] = (uint8_t)(ESP.getChipId() >> 8);
-	data[bufferSize+3] = (uint8_t)(ESP.getChipId() >> 0);
+	uint8_t data[bufferSize /*+ 4*/];
+	// data[bufferSize+0] = (uint8_t)(ESP.getChipId() >> 24);
+	// data[bufferSize+1] = (uint8_t)(ESP.getChipId() >> 16);
+	// data[bufferSize+2] = (uint8_t)(ESP.getChipId() >> 8);
+	// data[bufferSize+3] = (uint8_t)(ESP.getChipId() >> 0);
 
 	for (byte i = 0; i < bufferSize; ++i) {
 		data[i] = buffer[i];
@@ -426,11 +428,15 @@ void BuildBuffer(hash_t & h, const bool & open) {
         DEBUG_println("Bad server!"); // Сервер відповів на запит негативно
         Beep_s(25, 25 , 15);
         DEBUG_println( httpPi.errorToString(httpCode).c_str() );
+				// запис даних в ліст
+				myQueue.push( { .open = open, .time = millis(), .uid = h } ); // додати елемент в кінець
       }
     } else { // Сервер нічого не відповів
       DEBUG_printf("[HTTP] GET... failed, error: %s\n", httpPi.errorToString(httpCode).c_str());
       Beep_s(25, 25 , 15);
 			WiFi.disconnect(); // Перепідєднаємося!
+			// запис даних в ліст
+			myQueue.push( { .open = open, .time = millis(), .uid = h } ); // додати елемент в кінець
     }
     httpPi.end();
     DEBUG_print("dBm ");
@@ -478,7 +484,14 @@ void BuildBuffer(info &inf) {																					   // "sizeof(inf.time)"     "
       // file found at server
       if (httpCode == HTTP_CODE_OK) {
         //GetInstructions( httpPi.getString(), h , open); // Не треба нічого робити
-				myQueue.pop(); // Видалити цей запис з черги
+				DynamicJsonBuffer jsonBuffer;
+			  JsonObject& root = jsonBuffer.parseObject(httpPi.getString());
+				hash_t secret_xor = {0x01, 0x4A, 0x8F, 0xE5, 0xCC, 0xB1, 0x9B, 0xA6, 0x1C, 0x4C, 0x08, 0x73, 0xD3, 0x91, 0xE9, 0x87, 0x98, 0x2F, 0xBB, 0xD3};
+				secret_xor ^= inf.uid;
+			  if (root.success() && root["secret_key"].as<String>() == sha1(secret_xor.hash , sizeof(secret_xor)) ) {
+			    myQueue.pop(); // Видалити цей запис з черги;
+					DEBUG_println("Bad server!");
+			  }
       } else {
         DEBUG_println("Bad server!"); // Сервер відповів на запит негативно
         Beep_s(25, 25 , 15);
@@ -496,10 +509,6 @@ void BuildBuffer(info &inf) {																					   // "sizeof(inf.time)"     "
 }
 
 
-
-
-
-
 void GetInstructions(String jsonConfig, hash_t &h, const bool & open) {
   //DEBUG_println(jsonConfig);
   DynamicJsonBuffer jsonBuffer;
@@ -514,13 +523,14 @@ void GetInstructions(String jsonConfig, hash_t &h, const bool & open) {
 #endif
   /*
     {
-    "esp": "RFID_12625188",
-    "uid": "04132F92D22F80",
+    "esp": "RFID_006A5B88",
+    "uid": "A94A8FE5CCB19BA61C4C0873D391E987982FBBD3,
     "user_id": 1,
     "location_id": 3,
     "file_bin": "",
     "status": 200
 		"secret_key": 0xA94A8FE5CCB19BA61C4C0873D391E987982FBBD3
+    //secret_xor = {0x01, 0x4A, 0x8F, 0xE5, 0xCC, 0xB1, 0x9B, 0xA6, 0x1C, 0x4C, 0x08, 0x73, 0xD3, 0x91, 0xE9, 0x87, 0x98, 0x2F, 0xBB, 0xD3}
     }
   */
 	ESP.wdtFeed(); // нагодувати WDT
@@ -555,6 +565,8 @@ void GetInstructions(String jsonConfig, hash_t &h, const bool & open) {
 				Beep(659,500);
 				Beep(698,500);
 				Beep(784,500);
+				// запис даних в ліст
+				myQueue.push( { .open = open, .time = millis(), .uid = h } ); // додати елемент в кінець
 			}
       break;
     case 201: // вхід користувача
@@ -572,6 +584,8 @@ void GetInstructions(String jsonConfig, hash_t &h, const bool & open) {
 				Beep(659,500);
 				Beep(698,500);
 				Beep(784,500);
+				// запис даних в ліст
+				myQueue.push( { .open = open, .time = millis(), .uid = h } ); // додати елемент в кінець
 			}
       break;
 //    case 202: // вихід користувача
@@ -579,7 +593,8 @@ void GetInstructions(String jsonConfig, hash_t &h, const bool & open) {
 //      //delay(5000);
 //      break;
     case 203: // оновленя прошивки
-      updateESP( root["file_bin"].as<String>() );
+			if ( root["secret_key"].as<String>() == sha1(secret_xor.hash , sizeof(secret_xor)) )
+      	updateESP( root["file_bin"].as<String>() );
       break;
     case 401: // не зареєстрований девайс
     case 402: // не зареєстрований користувач
@@ -598,6 +613,8 @@ void GetInstructions(String jsonConfig, hash_t &h, const bool & open) {
 					Beep(659,500);
 					Beep(698,500);
 					Beep(784,500);
+					// запис даних в ліст
+					myQueue.push( { .open = open, .time = millis(), .uid = h } ); // додати елемент в кінець
 				}
 			}
       break;
